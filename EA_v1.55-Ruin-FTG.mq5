@@ -89,12 +89,29 @@
 //|  5. Recovery Grid DEFAULT OFF: di MC-v1.53-D, 149 posisi RECOV    |
 //|     (9.20 lot) merealisasikan -3.241,55 - lebih buruk per posisi  |
 //|     dari basket utama yang dilayaninya - dan ikut ter-stop-out.   |
+//|                                                                  |
+//|  === v1.55: PEMBERSIH RANJAU SL ===                              |
+//|  Forward test 8 Sep menemukan celah yang tersisa: jaring pengaman |
+//|  yang dipasang saat masih legal bisa jadi RANJAU ketika BE basket |
+//|  naik melewatinya (fill ladder di dekat harga menarik BE mendekati |
+//|  pasar - mekanisme perataan BE). Harga jatuh menembus SL lama     |
+//|  sebelum EA sempat bereaksi: 33 posisi dieksekusi server [sl]     |
+//|  -862, lalu EA menutup sisa 64 posisi +821 tiga detik kemudian    |
+//|  (net -41 dari 5,33 lot - selamat, tapi beruntung).               |
+//|  Perbaikan, tetap tanpa cut loss:                                 |
+//|  1. Saat clamp BE aktif (tidak ada SL legal yang bisa dipasang),  |
+//|     SL lama di sisi RUGI BE dihapus dari posisi. SL yang pasti    |
+//|     merugi lebih baik tidak ada - posisi kembali dijaga penuh     |
+//|     oleh trailing virtual. SL di sisi untung BE dibiarkan.        |
+//|  2. SL ranjau yang terdeteksi saat jaring normal langsung         |
+//|     disinkronkan ke kandidat legal sekarang (>= BE), tanpa dedup  |
+//|     advance - jaraknya ke net tidak relevan, bahayanya ke BE.     |
 //+------------------------------------------------------------------+
 
 // Satu sumber kebenaran untuk identitas build. Dipakai bersama oleh
 // #property version, semua log, dan panel ShowStatus. Di v1.43 angka
 // versi di-hardcode di dua tempat dan sempat tidak sinkron.
-#define EA_VERSION "1.54"
+#define EA_VERSION "1.55"
 #property version   EA_VERSION
 #property strict
 
@@ -477,6 +494,8 @@ datetime g_burst_close_since[BASKET_SLOTS] = {0, 0, 0, 0};
 // Zona ruin terakhir per basket (2=aman, 1=genting, 0=kritis). Supaya
 // transisi zona dicetak sekali saat terjadi, bukan tiap tick.
 int      g_ruin_zone_last[BASKET_SLOTS]    = {2, 2, 2, 2};
+// v1.55: throttle log pembersihan ranjau SL per basket.
+datetime g_ranjau_log[BASKET_SLOTS]        = {0, 0, 0, 0};
 
 //--- v1.50: state trailing virtual -----------------------------------
 // g_vstop adalah level exit yang sebenarnya dieksekusi EA. Nilainya
@@ -3781,6 +3800,67 @@ bool UpdateVirtualLevel(ENUM_POSITION_TYPE dir, long magic, double be,
 }
 
 //+------------------------------------------------------------------+
+//| v1.55: hapus SL server yang eksekusinya SEKARANG pasti merugi.    |
+//|                                                                  |
+//| Jaring pengaman dipasang hanya di sisi aman BE (clamp), tapi BE   |
+//| bukan angka beku: fill ladder di dekat harga menarik BE mendekati  |
+//| pasar, dan BE bisa naik MELEWATI SL lama yang dulunya legal.      |
+//| Sejak saat itu SL itu adalah ranjau: kalau harga menembusnya      |
+//| sebelum EA sempat bereaksi, broker mengeksekusinya di sisi rugi   |
+//| (terbukti 8 Sep: [sl] -862 pada 33 posisi).                       |
+//|                                                                  |
+//| Dipanggil dari cabang clamp ApplyBasketStop (kandidat SL baru     |
+//| tidak legal). Aturannya tetap prinsip tanpa cut loss: SL yang     |
+//| pasti merugi lebih baik TIDAK ADA; posisi kembali dijaga penuh    |
+//| oleh trailing virtual. SL yang masih di sisi untung BE dibiarkan. |
+//| Kegagalan modify dicoba lagi tick berikutnya (cabang clamp jalan  |
+//| tiap tick selama keadaan berlangsung).                            |
+//+------------------------------------------------------------------+
+void RemoveLosingStops(ENUM_POSITION_TYPE dir, long magic, double be)
+{
+   if(be <= 0.0) return;
+   int    slot     = SlotOf(magic);
+   double tol      = g_tick_size * 0.5;
+   int    removed  = 0;
+   int    attempts = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!IsBasketPosition(magic)) continue;
+
+      double sl = PositionGetDouble(POSITION_SL);
+      if(sl <= 0.0) continue;
+      bool losing = (dir == POSITION_TYPE_BUY) ? (sl < be - tol)
+                                               : (sl > be + tol);
+      if(!losing) continue;
+      if(attempts >= 10) break;         // batasi request per tick
+      attempts++;
+
+      double tp = PositionGetDouble(POSITION_TP);
+      ResetLastError();
+      if(trade.PositionModify(ticket, 0.0, tp))
+      {
+         removed++;
+         continue;
+      }
+      if(ClassifyRetcode(trade.ResultRetcode()) == FAIL_STALE)
+         continue;                      // posisi sudah tutup di broker
+   }
+
+   if(removed > 0 && TimeCurrent() - g_ranjau_log[slot] >= 60)
+   {
+      PrintFormat("RANJAU SL %s magic %I64d: %d SL server di sisi RUGI BE %s "
+                  "dihapus (clamp jaring aktif). Posisi kembali tanpa SL, "
+                  "exit dipegang trailing virtual. TANPA CUT LOSS.",
+                  (dir == POSITION_TYPE_BUY) ? "BUY" : "SELL", magic,
+                  removed, DoubleToString(be, g_digits));
+      g_ranjau_log[slot] = TimeCurrent();
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Jaring pengaman: SL server di belakang level virtual.             |
 //|                                                                  |
 //| Eksekutor exit adalah CloseBasket(). SL server hanya jaring kalau |
@@ -3861,6 +3941,9 @@ void ApplyBasketStop(ENUM_POSITION_TYPE dir, long magic, double be,
                      DoubleToString(vstop, g_digits));
          g_clamp_log[idx] = TimeCurrent();
       }
+      // v1.55: selama clamp aktif, SL lama di sisi rugi BE adalah ranjau -
+      // bersihkan, jangan dibiarkan menunggu dieksekusi broker.
+      RemoveLosingStops(dir, magic, be);
       return;
    }
 
@@ -3910,13 +3993,23 @@ void ApplyBasketStop(ENUM_POSITION_TYPE dir, long magic, double be,
          (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       double want;
 
-      if(cur_sl <= 0.0)
+      // v1.55: RANJAU = SL yang eksekusinya sekarang pasti merugi (di
+      // sisi rugi BE). Dibedakan dari SL sehat: dedup advance tidak
+      // berlaku untuknya (jaraknya ke net tidak relevan, bahayanya ke
+      // BE), langsung disinkronkan ke kandidat legal SAAT INI yang
+      // dijamin >= BE oleh NetStopCandidate. Mode baseline v1.43 tidak
+      // diubah (di sana SL boleh merugi by design untuk pembanding).
+      bool landmine = InpUseVirtualTrailing && cur_sl > 0.0 &&
+                      ((dir == POSITION_TYPE_BUY  && cur_sl < be - tol) ||
+                       (dir == POSITION_TYPE_SELL && cur_sl > be + tol));
+
+      if(cur_sl <= 0.0 || landmine)
       {
-         // Fill baru atau basket campur: SELALU disinkronkan tanpa
-         // menunggu TrailingStep, tapi ke nilai legal SAAT INI, bukan
-         // nilai basi. Nilai ini bisa lebih longgar dari net basket -
-         // itu disengaja, jaring tidak seragam masih jauh lebih baik
-         // daripada posisi tanpa SL sama sekali.
+         // Fill baru, basket campur, atau ranjau: SELALU disinkronkan
+         // tanpa menunggu TrailingStep, tapi ke nilai legal SAAT INI,
+         // bukan nilai basi. Nilai ini bisa lebih longgar dari net
+         // basket - itu disengaja, jaring tidak seragam masih jauh
+         // lebih baik daripada posisi tanpa SL sama sekali.
          want = fresh;
       }
       else
