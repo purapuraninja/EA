@@ -35,8 +35,8 @@ input int                 InpDeviationPoints     = 30;
 
 //--- Risk & Lot
 input bool                InpUseFixedLot         = false;
-input double              InpFixedLot            = 0.10;
-input double              InpRiskPercent         = 1.0;     // risk % balance
+input double              InpFixedLot            = 0.20;
+input double              InpRiskPercent         = 2.0;     // risk % balance
 
 //--- Filters (XAU default)
 input int                 InpMaxSpreadPoints     = 220;     // spread kamu ~160 pts -> kasih ruang
